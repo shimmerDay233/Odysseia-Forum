@@ -1,4 +1,5 @@
 from typing import List, Sequence
+from datetime import datetime
 from shared.models.tag_vote import TagVote
 from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,9 +73,32 @@ class TagSystemRepository:
         """删除帖子的所有相关索引数据"""
         statement = select(Thread).where(Thread.thread_id == thread_id)
         result = await self.session.execute(statement)
-        db_thread = result.first()
+        db_thread = result.scalars().first()
         if db_thread:
             await self.session.delete(db_thread)
+            await self.session.commit()
+
+    async def update_thread_activity(self, thread_id: int, last_active_at: datetime, reply_count: int):
+        """仅更新帖子的活跃时间和回复数"""
+        statement = select(Thread).where(Thread.thread_id == thread_id)
+        result = await self.session.execute(statement)
+        db_thread = result.scalars().first()
+
+        if db_thread:
+            db_thread.last_active_at = last_active_at
+            db_thread.reply_count = reply_count
+            self.session.add(db_thread)
+            await self.session.commit()
+
+    async def update_thread_reaction_count(self, thread_id: int, reaction_count: int):
+        """仅更新帖子的反应数"""
+        statement = select(Thread).where(Thread.thread_id == thread_id)
+        result = await self.session.execute(statement)
+        db_thread = result.scalars().first()
+
+        if db_thread:
+            db_thread.reaction_count = reaction_count
+            self.session.add(db_thread)
             await self.session.commit()
 
     async def get_tags_for_author(self, author_id: int) -> Sequence[Tag]:

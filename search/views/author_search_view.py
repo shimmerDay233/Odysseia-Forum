@@ -1,6 +1,7 @@
 import discord
 from typing import List, TYPE_CHECKING
 
+from shared.discord_utils import safe_defer
 from shared.models.tag import Tag
 from ..models.qo.thread_search import ThreadSearchQuery
 from .results_view import NewSearchResultsView
@@ -34,12 +35,12 @@ class NewAuthorTagSelectionView(discord.ui.View):
 
     async def update_view(self, interaction: discord.Interaction = None):
         """根据当前状态更新或编辑消息"""
-        target_interaction = interaction or self.original_interaction
+        # 如果有新的交互事件（如按钮点击），则对其进行defer
+        # 否则，对原始交互进行defer（仅在第一次加载时发生）
         if interaction:
-            await self.cog.bot.api_scheduler.submit(
-                coro=interaction.response.defer(),
-                priority=1
-            )
+            await safe_defer(interaction)
+        else:
+            await safe_defer(self.original_interaction)
         
         self.all_tags = await self.cog.tag_system_repo.get_tags_for_author(self.author_id)
         
@@ -55,20 +56,10 @@ class NewAuthorTagSelectionView(discord.ui.View):
 
         content = f"正在为作者 <@{self.author_id}> 配置搜索条件..."
         
-        if target_interaction.response.is_done():
-            await self.cog.bot.api_scheduler.submit(
-                coro=target_interaction.edit_original_response(content=content, view=self, embeds=[]),
-                priority=1
-            )
-        else:
-            await self.cog.bot.api_scheduler.submit(
-                coro=target_interaction.response.send_message(content=content, view=self, ephemeral=True),
-                priority=1
-            )
-            self.original_interaction = await self.cog.bot.api_scheduler.submit(
-                coro=target_interaction.original_response(),
-                priority=1
-            )
+        await self.cog.bot.api_scheduler.submit(
+            coro=self.original_interaction.edit_original_response(content=content, view=self, embeds=[]),
+            priority=1
+        )
 
     def create_tag_select(self, placeholder: str, selected_values: set, custom_id: str):
         options = [discord.SelectOption(label=tag.name, value=str(tag.id)) for tag in self.all_tags]
@@ -85,6 +76,7 @@ class NewAuthorTagSelectionView(discord.ui.View):
                 option.default = True
         
         async def select_callback(interaction: discord.Interaction):
+            await safe_defer(interaction)
             values = {int(v) for v in select.values if v != "no_tags"}
             if select.custom_id == "include_tags":
                 self.include_tags = values
@@ -96,10 +88,7 @@ class NewAuthorTagSelectionView(discord.ui.View):
         return select
 
     async def execute_search(self, interaction: discord.Interaction):
-        await self.cog.bot.api_scheduler.submit(
-            coro=interaction.response.defer(),
-            priority=1
-        )
+        await safe_defer(interaction)
 
         indexed_channel_ids = await self.cog.tag_system_repo.get_indexed_channel_ids()
 

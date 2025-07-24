@@ -1,5 +1,6 @@
 import json
 import discord
+import logging
 from discord.ext import commands
 import asyncio
 
@@ -11,8 +12,8 @@ from search.cog import Search
 from core.api_scheduler import APIScheduler
 
 class MyBot(commands.Bot):
-    def __init__(self, *, intents: discord.Intents, db_url: str):
-        super().__init__(command_prefix="/", intents=intents)
+    def __init__(self, *, intents: discord.Intents, db_url: str, proxy: str = None):
+        super().__init__(command_prefix="/", intents=intents, proxy=proxy)
         self.db_url = db_url
         # 初始化API调度器
         self.api_scheduler = APIScheduler(concurrent_requests=40)
@@ -43,6 +44,9 @@ class MyBot(commands.Bot):
         await super().close()
 
 async def main():
+    # 配置日志记录
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guilds = True
@@ -52,7 +56,8 @@ async def main():
     with open("config.json", "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    bot = MyBot(intents=intents, db_url=config["db_url"])
+    proxy = config.get("proxy") or None  
+    bot = MyBot(intents=intents, db_url=config["db_url"], proxy=proxy)
 
     @bot.event
     async def on_ready():

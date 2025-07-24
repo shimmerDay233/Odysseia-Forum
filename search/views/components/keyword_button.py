@@ -28,8 +28,8 @@ class KeywordModal(discord.ui.Modal, title="设置关键词过滤"):
         await self.update_callback(interaction)
 
 class KeywordButton(discord.ui.Button):
-    def __init__(self, update_callback):
-        super().__init__(label="📝 关键词", style=discord.ButtonStyle.secondary, row=2)
+    def __init__(self, update_callback, row: int = 2):
+        super().__init__(label="📝 关键词", style=discord.ButtonStyle.secondary, row=row)
         self.update_callback = update_callback
 
     async def callback(self, interaction: discord.Interaction):

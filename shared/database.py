@@ -15,7 +15,7 @@ DB_PATH = "forum_search.db"
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
 # 创建异步数据库引擎
-async_engine = create_async_engine(DATABASE_URL, echo=True)
+async_engine = create_async_engine(DATABASE_URL, echo=False)
 
 # 创建异步会话工厂
 AsyncSessionFactory = sessionmaker(

@@ -1,6 +1,7 @@
 import discord
 from typing import List, TYPE_CHECKING
 
+from shared.discord_utils import safe_defer
 from .channel_selection_view import ChannelSelectionView
 
 if TYPE_CHECKING:
@@ -15,11 +16,7 @@ class GlobalSearchView(discord.ui.View):
     @discord.ui.button(label="🌐 全局搜索", style=discord.ButtonStyle.success, custom_id="global_search_button")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """处理按钮点击，启动全局搜索流程。"""
-        if not interaction.response.is_done():
-            await self.cog.bot.api_scheduler.submit(
-                coro=interaction.response.defer(ephemeral=True),
-                priority=1
-            )
+        await safe_defer(interaction)
         
         async with self.cog.session_factory() as session:
             repo = self.cog.tag_system_repo(session)

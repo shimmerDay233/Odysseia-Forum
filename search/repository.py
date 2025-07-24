@@ -25,10 +25,10 @@ class SearchRepository:
         if query.exclude_authors:
             statement = statement.where(Thread.author_id.notin_(query.exclude_authors))
 
-        if query.after_date:
-            statement = statement.where(Thread.created_at >= query.after_date)
-        if query.before_date:
-            statement = statement.where(Thread.created_at <= query.before_date)
+        if query.after_ts:
+            statement = statement.where(Thread.created_at >= query.after_ts)
+        if query.before_ts:
+            statement = statement.where(Thread.created_at <= query.before_ts)
 
         if query.include_tags:
             if query.tag_logic == 'and':
@@ -104,13 +104,19 @@ class SearchRepository:
             
             # 使用 case 表达式避免除以零
             tag_weight = case(
-                (total_votes > 0,
+                (
+                    total_votes > 0,
                     (
-                        (total_upvotes_expr / total_votes + z*z / (2 * total_votes)) -
-                        z * func.sqrt((total_upvotes_expr * total_downvotes_expr) / total_votes + z*z / (4 * total_votes)) / total_votes
-                    ) / (1 + z*z / total_votes)
+                        (
+                            total_upvotes_expr / total_votes +
+                            (z*z / (2 * total_votes)) -
+                            z * func.sqrt(
+                                (total_upvotes_expr * total_downvotes_expr) / total_votes + (z*z / (4 * total_votes))
+                            ) / total_votes
+                        ) / (1 + (z*z / total_votes))
+                    )
                 ),
-                else_ = RankingConfig.DEFAULT_TAG_SCORE
+                else_=RankingConfig.DEFAULT_TAG_SCORE
             )
 
             # --- 2. 计算时间权重 (指数衰减) ---

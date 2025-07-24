@@ -2,8 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import datetime
+import logging
 
 from ranking_config import RankingConfig
+from shared.discord_utils import safe_defer
 from .views.author_search_view import NewAuthorTagSelectionView
 from .views.global_search_view import GlobalSearchView
 from sqlalchemy.orm import sessionmaker
@@ -16,6 +18,9 @@ from .views.author_search_view import NewAuthorTagSelectionView
 from .views.global_search_view import GlobalSearchView
 from .views.persistent_channel_search_view import PersistentChannelSearchView
 from .prefs_handler import SearchPreferencesHandler
+
+# 获取一个模块级别的 logger
+logger = logging.getLogger(__name__)
 
 class Search(commands.Cog):
     """搜索相关命令"""
@@ -44,24 +49,22 @@ class Search(commands.Cog):
         try:
             # 获取已索引的频道ID
             async with self.session_factory() as session:
-                repo = TagSystemRepository(session)
-                indexed_channel_ids = await repo.get_indexed_channel_ids()
-            
+                repo = self.tag_system_repo(session)
+                indexed_channel_ids_tuples = await repo.get_indexed_channel_ids()
+                indexed_channel_ids = {row[0] for row in indexed_channel_ids_tuples}
+
             self.channel_tags_cache = {}
-            
+
+            # 启动时尽力缓存，但不强制要求成功
             for guild in self.bot.guilds:
                 for channel in guild.channels:
                     if isinstance(channel, discord.ForumChannel) and channel.id in indexed_channel_ids:
-                        # 获取频道的所有可用标签
-                        tags = {}
-                        for tag in channel.available_tags:
-                            tags[tag.name] = tag.id
-                        self.channel_tags_cache[channel.id] = tags
+                        self.channel_tags_cache[channel.id] = {tag.name: tag.id for tag in channel.available_tags}
                         
-            print(f"已缓存 {len(self.channel_tags_cache)} 个频道的tags")
+            logger.info(f"已缓存 {len(self.channel_tags_cache)} 个频道的tags")
             
         except Exception as e:
-            print(f"缓存频道tags时出错: {e}")
+            logger.warning(f"缓存频道tags时出错: {e}", exc_info=True)
 
     def get_merged_tags(self, channel_ids: list[int]) -> list[tuple[int, str]]:
         """获取多个频道的合并tags，重名tag会被合并显示"""
@@ -79,14 +82,21 @@ class Search(commands.Cog):
     @app_commands.command(name="每页结果数量", description="设置每页展示的搜索结果数量（3-10）")
     @app_commands.describe(num="要设置的数量 (3-10)")
     async def set_page_size(self, interaction: discord.Interaction, num: app_commands.Range[int, 3, 10]):
-        async with self.session_factory() as session:
-            repo = SearchRepository(session)
-            await repo.save_user_preferences(interaction.user.id, {'results_per_page': num})
-        
-        await self.bot.api_scheduler.submit(
-            coro=interaction.response.send_message(f"已将每页结果数量设置为 {num}。", ephemeral=True),
-            priority=1
-        )
+        await safe_defer(interaction)
+        try:
+            async with self.session_factory() as session:
+                repo = SearchRepository(session)
+                await repo.save_user_preferences(interaction.user.id, {'results_per_page': num})
+            
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"已将每页结果数量设置为 {num}。", ephemeral=True),
+                priority=1
+            )
+        except Exception as e:
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 设置失败: {e}", ephemeral=True),
+                priority=1
+            )
 
 
     # ----- 搜索偏好设置 -----
@@ -184,9 +194,10 @@ class Search(commands.Cog):
         mild_penalty: float = None
     ):
         # 检查权限 (需要管理员权限)
+        await safe_defer(interaction)
         if not interaction.user.guild_permissions.administrator:
             await self.bot.api_scheduler.submit(
-                coro=interaction.response.send_message("此命令需要管理员权限。", ephemeral=True),
+                coro=interaction.followup.send("此命令需要管理员权限。", ephemeral=True),
                 priority=1
             )
             return
@@ -301,23 +312,24 @@ class Search(commands.Cog):
             )
             
             await self.bot.api_scheduler.submit(
-                coro=interaction.response.send_message(embed=embed, ephemeral=True),
+                coro=interaction.followup.send(embed=embed, ephemeral=True),
                 priority=1
             )
             
         except ValueError as e:
             await self.bot.api_scheduler.submit(
-                coro=interaction.response.send_message(f"❌ 配置错误：{e}", ephemeral=True),
+                coro=interaction.followup.send(f"❌ 配置错误：{e}", ephemeral=True),
                 priority=1
             )
         except Exception as e:
             await self.bot.api_scheduler.submit(
-                coro=interaction.response.send_message(f"❌ 配置失败：{e}", ephemeral=True),
+                coro=interaction.followup.send(f"❌ 配置失败：{e}", ephemeral=True),
                 priority=1
             )
 
     @app_commands.command(name="查看排序配置", description="查看当前搜索排序算法配置")
     async def view_ranking_config(self, interaction: discord.Interaction):
+        await safe_defer(interaction)
         embed = discord.Embed(
             title="🔧 当前排序算法配置",
             description="智能混合权重排序算法参数",
@@ -355,7 +367,7 @@ class Search(commands.Cog):
         embed.set_footer(text="管理员可使用 /排序算法配置 命令调整参数")
         
         await self.bot.api_scheduler.submit(
-            coro=interaction.response.send_message(embed=embed, ephemeral=True),
+            coro=interaction.followup.send(embed=embed, ephemeral=True),
             priority=1
         )
 
@@ -363,59 +375,73 @@ class Search(commands.Cog):
     @app_commands.guild_only()
     async def create_channel_search(self, interaction: discord.Interaction):
         """在一个帖子内创建一个持久化的搜索按钮，该按钮将启动一个仅限于该频道的搜索流程。"""
-        if not isinstance(interaction.channel, discord.Thread):
+        await safe_defer(interaction)
+        try:
+            if not isinstance(interaction.channel, discord.Thread):
+                await self.bot.api_scheduler.submit(
+                    coro=interaction.followup.send("请在帖子内使用此命令。", ephemeral=True),
+                    priority=1
+                )
+                return
+
+            channel_id = interaction.channel.parent_id
+
+            # 创建美观的embed
+            embed = discord.Embed(
+                title=f"🔍 {interaction.channel.parent.name} 频道搜索",
+                description=f"点击下方按钮，搜索 <#{channel_id}> 频道内的所有帖子",
+                color=0x3498db
+            )
+            embed.add_field(
+                name="使用方法",
+                value="根据标签、作者、关键词等条件进行搜索。",
+                inline=False
+            )
+
+            # 发送带有持久化视图的消息
             await self.bot.api_scheduler.submit(
-                coro=interaction.response.send_message("请在帖子内使用此命令。", ephemeral=True),
+                coro=interaction.channel.send(embed=embed, view=self.persistent_channel_search_view),
                 priority=1
             )
-            return
-
-        channel_id = interaction.channel.parent_id
-
-        # 创建美观的embed
-        embed = discord.Embed(
-            title=f"🔍 {interaction.channel.parent.name} 频道搜索",
-            description=f"点击下方按钮，搜索 <#{channel_id}> 频道内的所有帖子",
-            color=0x3498db
-        )
-        embed.add_field(
-            name="使用方法",
-            value="根据标签、作者、关键词等条件进行搜索。",
-            inline=False
-        )
-
-        # 发送带有持久化视图的消息
-        await self.bot.api_scheduler.submit(
-            coro=interaction.channel.send(embed=embed, view=self.persistent_channel_search_view),
-            priority=1
-        )
-        await self.bot.api_scheduler.submit(
-            coro=interaction.response.send_message("✅ 已成功创建频道内搜索按钮。", ephemeral=True),
-            priority=1
-        )
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send("✅ 已成功创建频道内搜索按钮。", ephemeral=True),
+                priority=1
+            )
+        except Exception as e:
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 创建失败: {e}", ephemeral=True),
+                priority=1
+            )
 
     @app_commands.command(name="创建全局搜索", description="在当前频道创建全局搜索按钮")
     async def create_global_search(self, interaction: discord.Interaction):
         """在当前频道创建一个持久化的全局搜索按钮。"""
-        embed = discord.Embed(
-            title="🌐 全局搜索",
-            description="搜索服务器内所有论坛频道的帖子",
-            color=0x2ecc71
-        )
-        embed.add_field(
-            name="使用方法",
-            value="1. 点击下方按钮选择要搜索的论坛频道\n2. 设置搜索条件（标签、关键词等）\n3. 查看搜索结果",
-            inline=False
-        )
-        view = GlobalSearchView(self)
-        await self.bot.api_scheduler.submit(
-            coro=interaction.channel.send(embed=embed, view=view),
-            priority=1
-        )
-        await self.bot.api_scheduler.submit(
-            coro=interaction.response.send_message("✅ 已创建全局搜索按钮。", ephemeral=True),
-            priority=1
-        )
+        await safe_defer(interaction)
+        try:
+            embed = discord.Embed(
+                title="🌐 全局搜索",
+                description="搜索服务器内所有论坛频道的帖子",
+                color=0x2ecc71
+            )
+            embed.add_field(
+                name="使用方法",
+                value="1. 点击下方按钮选择要搜索的论坛频道\n2. 设置搜索条件（标签、关键词等）\n3. 查看搜索结果",
+                inline=False
+            )
+            view = GlobalSearchView(self)
+            await self.bot.api_scheduler.submit(
+                coro=interaction.channel.send(embed=embed, view=view),
+                priority=1
+            )
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send("✅ 已创建全局搜索按钮。", ephemeral=True),
+                priority=1
+            )
+        except Exception as e:
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 创建失败: {e}", ephemeral=True),
+                priority=1
+            )
 
     @app_commands.command(name="全局搜索", description="开始一次仅自己可见的全局搜索")
     async def global_search(self, interaction: discord.Interaction):
@@ -424,57 +450,82 @@ class Search(commands.Cog):
 
     async def start_global_search_flow(self, interaction: discord.Interaction):
         """启动全局搜索流程的通用逻辑。"""
-        await self.bot.api_scheduler.submit(
-            coro=interaction.response.defer(ephemeral=True),
-            priority=1
-        )
-        
-        async with self.session_factory() as session:
-            repo = TagSystemRepository(session)
-            indexed_channel_ids = await repo.get_indexed_channel_ids()
+        await safe_defer(interaction)
+        try:
+            async with self.session_factory() as session:
+                repo = self.tag_system_repo(session)
+                indexed_channel_ids_tuples = await repo.get_indexed_channel_ids()
+                indexed_channel_ids = {row[0] for row in indexed_channel_ids_tuples}
+            
+            logger.debug(f"从数据库找到 {len(indexed_channel_ids)} 个已索引频道ID: {indexed_channel_ids}")
 
-        if not indexed_channel_ids:
-            await self.bot.api_scheduler.submit(
-                coro=interaction.followup.send("没有已索引的频道可供搜索。", ephemeral=True),
-                priority=1
-            )
-            return
+            if not indexed_channel_ids:
+                await interaction.followup.send("没有已索引的频道可供搜索。", ephemeral=True)
+                return
 
-        channels = [self.bot.get_channel(ch_id) for ch_id in indexed_channel_ids if isinstance(self.bot.get_channel(ch_id), discord.ForumChannel)]
-        
-        if not channels:
-            await self.bot.api_scheduler.submit(
-                coro=interaction.followup.send("找不到任何已索引的论坛频道。", ephemeral=True),
-                priority=1
-            )
-            return
+            channels = []
+            for ch_id in indexed_channel_ids:
+                logger.debug(f"正在处理频道ID: {ch_id}")
+                channel = self.bot.get_channel(ch_id)
+                logger.debug(f"  - get_channel (缓存) 结果: {'找到' if channel else '未找到'}")
+                
+                if channel is None:
+                    logger.debug(f"  - 缓存未命中，尝试 fetch_channel...")
+                    try:
+                        channel = await self.bot.fetch_channel(ch_id)
+                        logger.debug(f"  - fetch_channel (API) 结果: {'找到' if channel else '未找到'}")
+                    except discord.NotFound:
+                        logger.warning(f"  - fetch_channel 失败 (ID: {ch_id}): 未找到 (NotFound)。")
+                        continue
+                    except discord.Forbidden:
+                        logger.warning(f"  - fetch_channel 失败 (ID: {ch_id}): 无权限 (Forbidden)。")
+                        continue
+                    except Exception:
+                        logger.error(f"  - fetch_channel 失败 (ID: {ch_id})，出现意外错误。", exc_info=True)
+                        continue
+                
+                if isinstance(channel, discord.ForumChannel):
+                    logger.debug(f"  - 成功！频道 '{channel.name}' 是一个论坛频道，已添加到列表。")
+                    channels.append(channel)
+                    if ch_id not in self.channel_tags_cache:
+                        self.channel_tags_cache[ch_id] = {tag.name: tag.id for tag in channel.available_tags}
+                else:
+                    if channel:
+                        logger.warning(f"  - 失败。ID为 {ch_id} 的频道不是论坛频道 (类型: {type(channel)})。")
+                    else:
+                        logger.warning(f"  - 失败。在所有尝试后，ID为 {ch_id} 的频道对象仍为空。")
 
-        # 直接进入频道选择视图
-        view = ChannelSelectionView(self, interaction, channels)
-        await self.bot.api_scheduler.submit(
-            coro=interaction.followup.send("请选择要搜索的频道：", view=view, ephemeral=True),
-            priority=1
-        )
+            logger.debug(f"最终频道对象列表大小: {len(channels)}")
+            logger.debug(f"最终频道名称列表: {[ch.name for ch in channels]}")
+
+            if not channels:
+                await interaction.followup.send("❌ 未找到任何可供搜索的已索引论坛频道。\n请检查机器人权限或联系管理组。", ephemeral=True)
+                return
+
+            view = ChannelSelectionView(self, interaction, channels)
+            await interaction.followup.send("请选择要搜索的频道：", view=view, ephemeral=True)
+        except Exception:
+            logger.error("在 start_global_search_flow 中发生严重错误", exc_info=True)
+            # 确保即使有异常，也能给用户一个反馈
+            if not interaction.response.is_done():
+                await safe_defer(interaction)
+            await interaction.followup.send(f"❌ 启动搜索时发生严重错误，请联系管理员。", ephemeral=True)
 
     @app_commands.command(name="快捷搜索", description="快速搜索指定作者的所有帖子")
     @app_commands.describe(author="要搜索的作者（@用户 或 用户ID）")
     async def quick_author_search(self, interaction: discord.Interaction, author: discord.User):
         """启动一个交互式视图，用于搜索特定作者的帖子并按标签等进行筛选。"""
+        # Defer 将在 NewAuthorTagSelectionView 的 start() -> update_view() 中被调用
+        # 这里我们只需要捕获异常并用 followup 发送
         try:
             view = NewAuthorTagSelectionView(self, interaction, author.id)
             await view.start()
         except Exception as e:
-            # followup.send 只能在 defer 后使用，如果尚未响应，则使用 response.send_message
-            if not interaction.response.is_done():
-                await self.bot.api_scheduler.submit(
-                    coro=interaction.response.send_message(f"❌ 启动快捷搜索失败: {e}", ephemeral=True),
-                    priority=1
-                )
-            else:
-                await self.bot.api_scheduler.submit(
-                    coro=interaction.followup.send(f"❌ 启动快捷搜索失败: {e}", ephemeral=True),
-                    priority=1
-                )
+            await safe_defer(interaction)
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 启动快捷搜索失败: {e}", ephemeral=True),
+                priority=1
+            )
 
     # ----- Embed 构造 -----
     async def _build_thread_embed(self, thread: 'ThreadModel', guild: discord.Guild, preview_mode: str = "thumbnail") -> discord.Embed:
@@ -553,7 +604,7 @@ class Search(commands.Cog):
                 search_qo.limit = per_page
 
                 # 执行搜索
-                threads = await repo.search_threads(search_qo)
+                threads = await repo.search_threads(search_qo, offset=search_qo.offset, limit=search_qo.limit)
                 total_threads = await repo.count_threads(search_qo)
 
             if not threads:

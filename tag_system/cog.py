@@ -4,6 +4,7 @@ from discord.ext import commands
 import datetime
 from sqlalchemy.orm import sessionmaker
 
+from shared.discord_utils import safe_defer
 from .repository import TagSystemRepository
 from shared.database import get_session
 from .views.vote_view import TagVoteView
@@ -51,10 +52,123 @@ class TagSystem(commands.Cog):
                 await repo.delete_thread_index(thread_id=thread.id)
             await self.refresh_indexed_channels_cache()
 
-    # 其他监听器（on_message, on_raw_message_edit, etc.）可以暂时保持不变，
-    # 因为它们主要更新活跃时间等信息，这部分逻辑在 sync_thread 中已经覆盖。
-    # 为了简化，我们将主要依赖 on_thread_create/update/delete。
-    # 也可以在未来细化，只更新部分字段以提高性能。
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if not message.guild or not isinstance(message.channel, discord.Thread):
+            return
+        
+        thread = message.channel
+        if self.is_channel_indexed(thread.parent_id):
+            # 使用调度器提交数据库更新
+            await self.bot.api_scheduler.submit(
+                coro=self._update_activity(thread, message.created_at),
+                priority=5 # 中等优先级
+            )
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        if not payload.guild_id:
+            return
+            
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if isinstance(channel, discord.Thread) and self.is_channel_indexed(channel.parent_id):
+                # 如果是首楼消息被编辑，需要重新同步整个帖子
+                if payload.message_id == channel.id:
+                    await self.sync_thread(thread=channel, priority=2) # 较高优先级
+                else:
+                    # 普通消息编辑只更新活跃时间
+                    await self.bot.api_scheduler.submit(
+                        coro=self._update_activity(channel, datetime.datetime.now(datetime.timezone.utc)),
+                        priority=5
+                    )
+        except Exception as e:
+            print(f"处理消息编辑事件失败: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if not payload.guild_id:
+            return
+
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if isinstance(channel, discord.Thread) and self.is_channel_indexed(channel.parent_id):
+                # 如果首楼被删除，删除整个索引
+                if payload.message_id == channel.id:
+                    async with self.session_factory() as session:
+                        repo = TagSystemRepository(session=session)
+                        await repo.delete_thread_index(thread_id=channel.id)
+                    await self.refresh_indexed_channels_cache()
+                else:
+                    # 普通消息删除，更新回复数和活跃时间
+                    await self.bot.api_scheduler.submit(
+                        coro=self._update_activity(channel),
+                        priority=5
+                    )
+        except Exception as e:
+            print(f"处理消息删除事件失败: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if not payload.guild_id:
+            return
+        
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if isinstance(channel, discord.Thread) and self.is_channel_indexed(channel.parent_id):
+                # 只有对首楼消息的反应才更新统计
+                if payload.message_id == channel.id:
+                    await self.bot.api_scheduler.submit(
+                        coro=self._update_reaction_count(channel),
+                        priority=5
+                    )
+        except Exception as e:
+            print(f"处理反应添加事件失败: {e}")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if not payload.guild_id:
+            return
+            
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if isinstance(channel, discord.Thread) and self.is_channel_indexed(channel.parent_id):
+                # 只有对首楼消息的反应才更新统计
+                if payload.message_id == channel.id:
+                    await self.bot.api_scheduler.submit(
+                        coro=self._update_reaction_count(channel),
+                        priority=5
+                    )
+        except Exception as e:
+            print(f"处理反应移除事件失败: {e}")
+
+    async def _update_activity(self, thread: discord.Thread, last_active_time: datetime = None):
+        """(协程) 更新帖子的活跃度和回复数"""
+        if last_active_time is None:
+            # 如果没有提供时间，就用当前时间
+            last_active_time = datetime.datetime.now(datetime.timezone.utc)
+        
+        # message_count 通常是准确的，除非有大量删除
+        reply_count = thread.message_count
+        
+        async with self.session_factory() as session:
+            repo = TagSystemRepository(session)
+            await repo.update_thread_activity(thread.id, last_active_time, reply_count)
+
+    async def _update_reaction_count(self, thread: discord.Thread):
+        """(协程) 更新帖子的反应数"""
+        try:
+            # 优先从缓存获取，失败则API调用
+            first_msg = thread.get_partial_message(thread.id)
+            first_msg = await first_msg.fetch()
+            
+            reaction_count = max([r.count for r in first_msg.reactions]) if first_msg.reactions else 0
+            
+            async with self.session_factory() as session:
+                repo = TagSystemRepository(session)
+                await repo.update_thread_reaction_count(thread.id, reaction_count)
+        except Exception as e:
+            print(f"更新反应数失败 (帖子ID: {thread.id}): {e}")
 
     async def sync_thread(self, thread: discord.Thread, priority: int = 10):
         """
@@ -111,45 +225,77 @@ class TagSystem(commands.Cog):
 
     @app_commands.command(name="标签评价", description="对当前帖子的标签进行评价（赞或踩）")
     async def tag_rate(self, interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message("此命令只能在帖子（Thread）中使用。", ephemeral=True)
-            return
+        await safe_defer(interaction)
+        try:
+            if not isinstance(interaction.channel, discord.Thread):
+                await self.bot.api_scheduler.submit(
+                    coro=interaction.followup.send("此命令只能在帖子中使用。", ephemeral=True),
+                    priority=1
+                )
+                return
 
-        if not interaction.channel.applied_tags:
-            await interaction.response.send_message("该帖子没有应用任何标签。", ephemeral=True)
-            return
+            if not interaction.channel.applied_tags:
+                await self.bot.api_scheduler.submit(
+                    coro=interaction.followup.send("该帖子没有应用任何标签。", ephemeral=True),
+                    priority=1
+                )
+                return
 
-        # 将会话工厂传递给视图
-        view = TagVoteView(tags=interaction.channel.applied_tags, session_factory=self.session_factory)
-        await interaction.response.send_message(content="请选择您要评价的标签：", view=view, ephemeral=True)
+            # 将会话工厂传递给视图
+            view = TagVoteView(tags=interaction.channel.applied_tags, session_factory=self.session_factory)
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(content="请选择您要评价的标签：", view=view, ephemeral=True),
+                priority=1
+            )
+        except Exception as e:
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 命令执行失败: {e}", ephemeral=True),
+                priority=1
+            )
 
     @app_commands.command(name="查看标签评价", description="查看当前帖子的标签评价统计")
     async def check_tag_stats(self, interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message("此命令只能在帖子（Thread）中使用。", ephemeral=True)
-            return
+        await safe_defer(interaction)
+        try:
+            if not isinstance(interaction.channel, discord.Thread):
+                await self.bot.api_scheduler.submit(
+                    coro=interaction.followup.send("此命令只能在帖子（Thread）中使用。", ephemeral=True),
+                    priority=1
+                )
+                return
 
-        async with self.session_factory() as session:
-            repo = TagSystemRepository(session=session)
-            stats = await repo.get_tag_vote_stats(thread_id=interaction.channel.id)
-        
-        if not stats:
-            await interaction.response.send_message("该帖子暂无任何标签评价。", ephemeral=True)
-            return
+            async with self.session_factory() as session:
+                repo = TagSystemRepository(session=session)
+                stats = await repo.get_tag_vote_stats(thread_id=interaction.channel.id)
+            
+            if not stats:
+                await self.bot.api_scheduler.submit(
+                    coro=interaction.followup.send("该帖子暂无任何标签评价。", ephemeral=True),
+                    priority=1
+                )
+                return
 
-        embed = discord.Embed(
-            title=f"帖子 “{interaction.channel.name}” 的标签评价",
-            color=discord.Color.blue()
-        )
-        
-        # 对标签按名称排序，以获得一致的显示顺序
-        sorted_tags = sorted(stats.items())
-
-        for tag_name, data in sorted_tags:
-            embed.add_field(
-                name=tag_name,
-                value=f"👍 {data.get('up', 0)}   👎 {data.get('down', 0)}   总分: **{data.get('score', 0)}**",
-                inline=False
+            embed = discord.Embed(
+                title=f"帖子 “{interaction.channel.name}” 的标签评价",
+                color=discord.Color.blue()
             )
             
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            # 对标签按名称排序，以获得一致的显示顺序
+            sorted_tags = sorted(stats.items())
+
+            for tag_name, data in sorted_tags:
+                embed.add_field(
+                    name=tag_name,
+                    value=f"👍 {data.get('up', 0)}   👎 {data.get('down', 0)}   总分: **{data.get('score', 0)}**",
+                    inline=False
+                )
+                
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(embed=embed, ephemeral=True),
+                priority=1
+            )
+        except Exception as e:
+            await self.bot.api_scheduler.submit(
+                coro=interaction.followup.send(f"❌ 命令执行失败: {e}", ephemeral=True),
+                priority=1
+            )

@@ -1,4 +1,5 @@
 import discord
+from shared.discord_utils import safe_defer
 from ...repository import TagSystemRepository
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -27,7 +28,7 @@ class TagVoteButton(discord.ui.Button):
         if not view:
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction)
         
         try:
             # 从 session_factory 创建临时的 session 和 repository
@@ -40,7 +41,13 @@ class TagVoteButton(discord.ui.Button):
                     tag_id=self.tag.id,
                     vote_value=self.vote_value
                 )
-            await interaction.followup.send("您的评价已记录！", ephemeral=True)
+            await view.cog.bot.api_scheduler.submit(
+                coro=interaction.followup.send("您的评价已记录！", ephemeral=True),
+                priority=1
+            )
         except Exception as e:
             print(f"记录标签投票时出错: {e}")
-            await interaction.followup.send("处理您的评价时发生错误，请稍后再试。", ephemeral=True)
+            await view.cog.bot.api_scheduler.submit(
+                coro=interaction.followup.send("处理您的评价时发生错误，请稍后再试。", ephemeral=True),
+                priority=1
+            )

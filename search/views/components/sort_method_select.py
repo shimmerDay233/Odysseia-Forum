@@ -1,7 +1,7 @@
 import discord
 
 class SortMethodSelect(discord.ui.Select):
-    def __init__(self, current_sort: str, update_callback):
+    def __init__(self, current_sort: str, update_callback, row: int = 0):
         options = [
             discord.SelectOption(
                 label="🧠 综合排序",
@@ -11,14 +11,14 @@ class SortMethodSelect(discord.ui.Select):
             ),
             discord.SelectOption(
                 label="🕐 按发帖时间",
-                value="created_time", 
+                value="created_time",
                 description="按帖子创建时间倒序排列",
                 default=(current_sort == "created_time")
             ),
             discord.SelectOption(
                 label="⏰ 按活跃时间",
                 value="active_time",
-                description="按最近活跃时间倒序排列", 
+                description="按最近活跃时间倒序排列",
                 default=(current_sort == "active_time")
             ),
             discord.SelectOption(
@@ -28,7 +28,7 @@ class SortMethodSelect(discord.ui.Select):
                 default=(current_sort == "reaction_count")
             )
         ]
-        super().__init__(placeholder="选择排序方式...", options=options, row=3)
+        super().__init__(placeholder="选择排序方式...", options=options, row=row)
         self.update_callback = update_callback
 
     async def callback(self, interaction: discord.Interaction):

@@ -2,12 +2,15 @@ import discord
 import math
 from typing import TYPE_CHECKING
 
+from search.models.qo.thread_search import ThreadSearchQuery
+from shared.discord_utils import safe_defer
+
 if TYPE_CHECKING:
     from ..cog import Search
     from ..models.qo.thread_search import ThreadSearchQO
 
 class NewSearchResultsView(discord.ui.View):
-    def __init__(self, cog: "Search", interaction: discord.Interaction, search_qo: "ThreadSearchQO", total: int, page: int, per_page: int):
+    def __init__(self, cog: "Search", interaction: discord.Interaction, search_qo: "ThreadSearchQuery", total: int, page: int, per_page: int, page_callback):
         super().__init__(timeout=900)
         self.cog = cog
         self.interaction = interaction
@@ -16,6 +19,7 @@ class NewSearchResultsView(discord.ui.View):
         self.page = page
         self.per_page = per_page
         self.max_page = max(1, math.ceil(total / per_page))
+        self.page_callback = page_callback
 
         self.update_buttons()
 
@@ -42,26 +46,9 @@ class NewSearchResultsView(discord.ui.View):
         self.add_item(last_page)
 
     async def go_to_page(self, interaction: discord.Interaction, page: int):
-        await self.cog.bot.api_scheduler.submit(
-            coro=interaction.response.defer(),
-            priority=1
-        )
-        self.page = page
-        
-        results = await self.cog._search_and_display(interaction, self.search_qo, self.page)
-        
-        if results['has_results']:
-            self.update_buttons()
-            content = f"搜索结果：找到 {self.total} 个帖子 (第{self.page}/{self.max_page}页)"
-            await self.cog.bot.api_scheduler.submit(
-                coro=self.interaction.edit_original_response(content=content, embeds=results['embeds'], view=self),
-                priority=1
-            )
-        else:
-            await self.cog.bot.api_scheduler.submit(
-                coro=self.interaction.edit_original_response(content="没有更多结果了。", embeds=[], view=None),
-                priority=1
-            )
+        # 不再自己执行搜索，而是调用从 GenericSearchView 传入的回调函数
+        if self.page_callback:
+            await self.page_callback(interaction, page=page)
 
     async def go_to_first_page(self, interaction: discord.Interaction):
         await self.go_to_page(interaction, 1)
