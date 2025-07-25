@@ -67,7 +67,7 @@ class TagSystemRepository:
         """获取所有已索引的频道ID列表"""
         statement = select(Thread.channel_id).distinct()
         result = await self.session.execute(statement)
-        return result.all()
+        return result.scalars().all()
 
     async def delete_thread_index(self, thread_id: int):
         """删除帖子的所有相关索引数据"""
@@ -110,7 +110,7 @@ class TagSystemRepository:
             .distinct()
         )
         result = await self.session.execute(statement)
-        return result.all()
+        return result.scalars().all()
     
     async def get_tags_for_channels(self, channel_ids: List[int]) -> Sequence[Tag]:
         """获取指定频道列表内的所有唯一标签"""
@@ -121,7 +121,7 @@ class TagSystemRepository:
             .distinct()
         )
         result = await self.session.execute(statement)
-        return result.all()
+        return result.scalars().all()
     
     async def _update_thread_vote_summary(self, thread_id: int):
         """

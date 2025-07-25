@@ -59,10 +59,9 @@ class Indexer(commands.Cog):
         dashboard.progress['finished'] = True
         await dashboard.update_embed()
 
-        # 通知TagSystem刷新缓存
-        tag_system_cog: TagSystem = self.bot.get_cog("TagSystem")
-        if tag_system_cog:
-            await tag_system_cog.refresh_indexed_channels_cache()
+        # 索引完成，分发一个全局事件，通知所有相关模块刷新缓存
+        logging.info(f"[{dashboard.channel.id}] 索引完成，分发 'index_updated' 事件。")
+        self.bot.dispatch("index_updated")
 
     async def producer(self, dashboard: IndexerDashboard):
         """生产者：发现帖子并放入队列"""
@@ -116,7 +115,7 @@ class Indexer(commands.Cog):
                 break
             
             if tag_system_cog:
-                await tag_system_cog.sync_thread(thread)
+                await tag_system_cog.sync_thread(thread, fetch_if_incomplete=True)
 
             progress['processed'] += 1
             

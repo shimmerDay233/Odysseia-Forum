@@ -4,10 +4,10 @@ from typing import TYPE_CHECKING
 
 from search.models.qo.thread_search import ThreadSearchQuery
 from shared.discord_utils import safe_defer
+from .components.page_jump_modal import PageJumpModal
 
 if TYPE_CHECKING:
     from ..cog import Search
-    from ..models.qo.thread_search import ThreadSearchQO
 
 class NewSearchResultsView(discord.ui.View):
     def __init__(self, cog: "Search", interaction: discord.Interaction, search_qo: "ThreadSearchQuery", total: int, page: int, per_page: int, page_callback):
@@ -34,7 +34,8 @@ class NewSearchResultsView(discord.ui.View):
         prev_page.callback = self.go_to_previous_page
         self.add_item(prev_page)
 
-        current_page_button = discord.ui.Button(label=f"{self.page}/{self.max_page}", style=discord.ButtonStyle.primary, disabled=True)
+        current_page_button = discord.ui.Button(label=f"{self.page}/{self.max_page}", style=discord.ButtonStyle.primary, disabled=False)
+        current_page_button.callback = self.show_page_jump_modal
         self.add_item(current_page_button)
 
         next_page = discord.ui.Button(label="▶️", style=discord.ButtonStyle.secondary, disabled=(self.page == self.max_page))
@@ -45,8 +46,13 @@ class NewSearchResultsView(discord.ui.View):
         last_page.callback = self.go_to_last_page
         self.add_item(last_page)
 
+    async def show_page_jump_modal(self, interaction: discord.Interaction):
+        """显示用于跳转页面的模态框"""
+        modal = PageJumpModal(max_page=self.max_page, submit_callback=self.go_to_page)
+        await interaction.response.send_modal(modal)
+
     async def go_to_page(self, interaction: discord.Interaction, page: int):
-        # 不再自己执行搜索，而是调用从 GenericSearchView 传入的回调函数
+        # 调用从 GenericSearchView 传入的回调函数
         if self.page_callback:
             await self.page_callback(interaction, page=page)
 

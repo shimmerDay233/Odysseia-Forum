@@ -43,11 +43,11 @@ class GenericSearchView(discord.ui.View):
         self.tags_per_page = 25
 
     async def start(self):
-        """初始化视图并发送或编辑消息"""
+        """初始化视图"""
         await self.update_view(self.original_interaction)
 
     def get_filter_components(self) -> List[discord.ui.Item]:
-        """准备所有筛选UI组件的列表，但不添加到视图中。严格按照经典布局。"""
+        """准备所有筛选UI组件的列表，但不添加到视图中。"""
         components = []
         
         # 第 0 行: 正选标签
@@ -62,24 +62,24 @@ class GenericSearchView(discord.ui.View):
         if len(self.all_tags) > self.tags_per_page:
             components.append(TagPageButton("prev", self.on_tag_page_change, row=2))
         
-        components.append(TagLogicButton(self.tag_logic, self.on_filter_change, row=2))
+        components.append(TagLogicButton(self.tag_logic, self.on_tag_logic_change, row=2))
         
         if len(self.all_tags) > self.tags_per_page:
             components.append(TagPageButton("next", self.on_tag_page_change, row=2))
             
-        components.append(SortOrderButton(self.sort_order, self.on_filter_change, row=2))
+        components.append(SortOrderButton(self.sort_order, self.on_sort_order_change, row=2))
         
         # 第 3 行: 排序选择器
-        components.append(SortMethodSelect(self.sort_method, self.on_filter_change, row=3))
+        components.append(SortMethodSelect(self.sort_method, self.on_sort_method_change, row=3))
         
         return components
 
     async def update_view(self, interaction: discord.Interaction, page: int = 1):
-        """根据当前状态更新整个视图，包括UI组件和搜索结果。"""
+        """根据当前状态更新整个视图，包括UI组件和搜索结果"""
         await safe_defer(interaction)
         self.page = page
 
-        # 1. 获取数据
+        # 获取数据
         async with self.cog.session_factory() as session:
             repo = self.cog.tag_system_repo(session)
             if not self.all_tags:
@@ -88,12 +88,14 @@ class GenericSearchView(discord.ui.View):
         qo = self.build_query_object()
         results = await self.cog._search_and_display(interaction, qo, self.page)
 
-        # 2. 准备所有UI组件
+        # 准备所有UI组件
         filter_components = self.get_filter_components()
 
-        # 3. 构建消息和最终视图
-        content = self.build_content_string(results)
+        # 构建消息和最终视图
+        content = "搜索结果"
         embeds = results.get('embeds', [])
+        summary_embed = self.build_summary_embed(results)
+        embeds.append(summary_embed)
 
         final_view = None
         if results.get('has_results'):
@@ -111,16 +113,31 @@ class GenericSearchView(discord.ui.View):
             for item in filter_components:
                 final_view.add_item(item)
 
-        # 4. 更新消息
+        # 更新消息
         edit_coro = interaction.edit_original_response(content=content, view=final_view, embeds=embeds)
         await self.cog.bot.api_scheduler.submit(coro=edit_coro, priority=1)
 
     async def on_filter_change(self, interaction: discord.Interaction):
-        """当任何筛选条件改变时调用此方法。"""
+        """当任何筛选条件改变时调用此方法"""
         await self.update_view(interaction, page=1)
         
+    async def on_sort_order_change(self, interaction: discord.Interaction):
+        """处理排序顺序改变的逻辑"""
+        self.sort_order = "asc" if self.sort_order == "desc" else "desc"
+        await self.on_filter_change(interaction)
+
+    async def on_tag_logic_change(self, interaction: discord.Interaction):
+        """处理标签匹配逻辑改变的逻辑"""
+        self.tag_logic = "or" if self.tag_logic == "and" else "and"
+        await self.on_filter_change(interaction)
+
+    async def on_sort_method_change(self, interaction: discord.Interaction, new_method: str):
+        """处理排序方法改变的逻辑"""
+        self.sort_method = new_method
+        await self.on_filter_change(interaction)
+
     async def on_tag_page_change(self, interaction: discord.Interaction, action: str):
-        """处理标签翻页。"""
+        """处理标签翻页"""
         max_page = (len(self.all_tags) - 1) // self.tags_per_page
         if action == "prev":
             self.tag_page = max(0, self.tag_page - 1)
@@ -136,16 +153,26 @@ class GenericSearchView(discord.ui.View):
         # 为简化，暂时只重新搜索
         await self.update_view(interaction, page=1)
 
-    def create_tag_select(self, placeholder: str, selected_values: set, custom_id: str, row: int):
-        """创建一个支持分页的标签选择下拉菜单。"""
+    def create_tag_select(self, placeholder_prefix: str, selected_values: set, custom_id: str, row: int):
+        """创建一个支持分页的标签选择下拉菜单"""
         start_idx = self.tag_page * self.tags_per_page
         end_idx = start_idx + self.tags_per_page
         current_page_tags = self.all_tags[start_idx:end_idx]
         
         options = [discord.SelectOption(label=tag.name, value=str(tag.id)) for tag in current_page_tags]
         
+        # 根据已选中的值动态生成 placeholder
+        selected_tag_names = [tag.name for tag in self.all_tags if tag.id in selected_values]
+        
+        if selected_tag_names:
+            placeholder_text = f"已{placeholder_prefix}: " + ", ".join(selected_tag_names)
+            if len(placeholder_text) > 100:
+                placeholder_text = placeholder_text[:97] + "..."
+        else:
+            placeholder_text = f"选择要{placeholder_prefix}的标签 (第 {self.tag_page + 1} 页)"
+
         select = discord.ui.Select(
-            placeholder=f"选择要{placeholder}的标签 (第 {self.tag_page + 1} 页)",
+            placeholder=placeholder_text,
             options=options if options else [discord.SelectOption(label="无可用标签", value="no_tags")],
             min_values=0, max_values=len(options) if options else 1,
             custom_id=custom_id, disabled=not options, row=row
@@ -171,7 +198,7 @@ class GenericSearchView(discord.ui.View):
         return select
 
     async def on_author_select(self, interaction: discord.Interaction, users: List[discord.User]):
-        """处理作者选择的回调。"""
+        """处理作者选择的回调"""
         self.author_ids = {user.id for user in users}
         await self.update_view(interaction, page=1)
 
@@ -189,9 +216,9 @@ class GenericSearchView(discord.ui.View):
             sort_order=self.sort_order
         )
 
-    def build_content_string(self, results: dict) -> str:
-        """构建并返回显示当前所有筛选条件和结果摘要的文本。"""
-        parts = ["**全局搜索**\n"]
+    def build_summary_embed(self, results: dict) -> discord.Embed:
+        """构建并返回一个包含当前筛选条件和结果摘要的Embed"""
+        description_parts = []
         filters = []
         if self.include_tags:
             names = [tag.name for tag in self.all_tags if tag.id in self.include_tags]
@@ -203,19 +230,27 @@ class GenericSearchView(discord.ui.View):
             filters.append(f"作者: {', '.join([f'<@{uid}>' for uid in self.author_ids])}")
         if self.keywords:
             filters.append(f"关键词: {self.keywords}")
-        
+
         if filters:
-            parts.append(" | ".join(filters))
-        
+            description_parts.append("\n".join(filters))
+
         if results.get('has_results'):
-            parts.append(f"\n\n🔍 **找到 {results['total']} 个帖子** (第{results['page']}/{results['max_page']}页)")
+            summary = f"🔍 找到 {results['total']} 个帖子 (第{results['page']}/{results['max_page']}页)"
+            color = discord.Color.green()
         else:
-            parts.append("\n\n" + results.get('error', '没有找到符合条件的结果。'))
-            
-        return "\n".join(parts)
+            summary = results.get('error', '没有找到符合条件的结果。')
+            color = discord.Color.orange()
+        
+        description_parts.append(summary)
+        
+        embed = discord.Embed(
+            description="\n".join(description_parts),
+            color=color
+        )
+        return embed
 
     async def on_timeout(self):
-        """当视图超时时，保存状态并显示一个带有“继续”按钮的新视图。"""
+        """当视图超时时，保存状态并显示一个带有“继续”按钮的新视图"""
         state = {
             'channel_ids': self.channel_ids,
             'include_tags': list(self.include_tags),

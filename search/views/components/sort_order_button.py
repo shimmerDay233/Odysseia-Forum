@@ -7,5 +7,4 @@ class SortOrderButton(discord.ui.Button):
         self.update_callback = update_callback
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.sort_order = "asc" if self.view.sort_order == "desc" else "desc"
         await self.update_callback(interaction)

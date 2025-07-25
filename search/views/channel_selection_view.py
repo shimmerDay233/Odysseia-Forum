@@ -9,11 +9,12 @@ if TYPE_CHECKING:
 
 class ChannelSelectionView(discord.ui.View):
     """第一步：让用户选择要搜索的频道（支持多选）。"""
-    def __init__(self, cog: "Search", original_interaction: discord.Interaction, channels: List[discord.ForumChannel]):
+    def __init__(self, cog: "Search", original_interaction: discord.Interaction, channels: List[discord.ForumChannel], all_channel_ids: List[int]):
         super().__init__(timeout=900)
         self.cog = cog
         self.original_interaction = original_interaction
         self.channels = channels
+        self.all_channel_ids = all_channel_ids
         self.selected_channel_ids: List[int] = []
         
         # 构建选项
@@ -65,7 +66,7 @@ class ChannelSelectionView(discord.ui.View):
         
         if "all" in selected_values:
             # 如果选择了 "all"，则使用所有可用的频道ID
-            self.selected_channel_ids = [ch.id for ch in self.channels]
+            self.selected_channel_ids = self.all_channel_ids
         else:
             self.selected_channel_ids = [int(v) for v in selected_values]
 

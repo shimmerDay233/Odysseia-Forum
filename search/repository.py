@@ -1,5 +1,6 @@
+import logging
 from typing import List, Optional, Sequence
-from sqlmodel import select, func, or_, case, cast, JSON, Float
+from sqlmodel import select, func, or_, and_, case, cast, JSON, Float
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -80,94 +81,103 @@ class SearchRepository:
         statement = self._apply_search_filters(query, statement)
         
         result = await self.session.execute(statement)
-        return result.one()
+        return result.scalar_one()
 
-    async def search_threads(self, query: ThreadSearchQuery, offset: int, limit: int) -> Sequence[Thread]:
-        """根据搜索条件搜索帖子并分页"""
-        statement = select(Thread).options(selectinload(Thread.tags))
-        statement = self._apply_search_filters(query, statement)
-
-        # 排序
-        if query.sort_method == 'comprehensive':
+    def _get_comprehensive_order_by(self, query: ThreadSearchQuery):
+        """计算综合排序的 order_by 子句"""
+        if query.include_tags:
             # --- 1. 计算标签总分 (Wilson Score) ---
-            total_upvotes_expr = 0.0
-            total_downvotes_expr = 0.0
-            if query.include_tags:
-                for tag_name in query.include_tags:
-                    total_upvotes_expr += func.coalesce(cast(func.json_extract(Thread.tag_votes_summary, f'$.{tag_name}.upvotes'), Float), 0.0)
-                    total_downvotes_expr += func.coalesce(cast(func.json_extract(Thread.tag_votes_summary, f'$.{tag_name}.downvotes'), Float), 0.0)
+            total_upvotes_expr = cast(0.0, Float)
+            total_downvotes_expr = cast(0.0, Float)
+            for tag_name in query.include_tags:
+                total_upvotes_expr += func.coalesce(cast(func.json_extract(Thread.tag_votes_summary, f'$.{tag_name}.upvotes'), Float), 0.0)
+                total_downvotes_expr += func.coalesce(cast(func.json_extract(Thread.tag_votes_summary, f'$.{tag_name}.downvotes'), Float), 0.0)
             
-            total_votes = total_upvotes_expr + total_downvotes_expr
+            total_votes = cast(total_upvotes_expr + total_downvotes_expr, Float)
             
             # Wilson Score Lower Bound 实现
             z = RankingConfig.WILSON_CONFIDENCE_LEVEL
             
-            # 使用 case 表达式避免除以零
+            wilson_score = (
+                (total_upvotes_expr / total_votes) + func.pow(z, 2) / (2 * total_votes) -
+                z * func.sqrt(
+                    ((total_upvotes_expr / total_votes) * (1 - (total_upvotes_expr / total_votes)) / total_votes) +
+                    (func.pow(z, 2) / (4 * func.pow(total_votes, 2)))
+                )
+            ) / (1 + func.pow(z, 2) / total_votes)
+
             tag_weight = case(
                 (
                     total_votes > 0,
-                    (
-                        (
-                            total_upvotes_expr / total_votes +
-                            (z*z / (2 * total_votes)) -
-                            z * func.sqrt(
-                                (total_upvotes_expr * total_downvotes_expr) / total_votes + (z*z / (4 * total_votes))
-                            ) / total_votes
-                        ) / (1 + (z*z / total_votes))
-                    )
+                    case((wilson_score > 0, wilson_score), else_=0)
                 ),
                 else_=RankingConfig.DEFAULT_TAG_SCORE
             )
-
-            # --- 2. 计算时间权重 (指数衰减) ---
-            # julianday 计算天数差，更精确
-            time_diff_days = func.julianday('now') - func.julianday(Thread.last_active_at)
-            time_weight = func.exp(-RankingConfig.TIME_DECAY_RATE * time_diff_days)
-
-            # --- 3. 计算反应权重 (对数归一化) ---
-            reaction_weight = func.min(
-                RankingConfig.MAX_REACTION_SCORE,
-                func.log(cast(Thread.reaction_count, Float) + 1) / func.log(RankingConfig.REACTION_LOG_BASE + 1)
-            )
-
-            # --- 4. 计算基础综合分数 ---
-            base_score = (
-                time_weight * RankingConfig.TIME_WEIGHT_FACTOR +
-                tag_weight * RankingConfig.TAG_WEIGHT_FACTOR +
-                reaction_weight * RankingConfig.REACTION_WEIGHT_FACTOR
-            )
-
-            # --- 5. 应用恶评惩罚 ---
-            final_score = case(
-                (
-                    (tag_weight < RankingConfig.SEVERE_PENALTY_THRESHOLD) &
-                    (total_votes >= RankingConfig.SEVERE_PENALTY_MIN_VOTES),
-                    base_score * RankingConfig.SEVERE_PENALTY_FACTOR
-                ),
-                (
-                    (tag_weight < RankingConfig.MILD_PENALTY_THRESHOLD) &
-                    (total_votes >= RankingConfig.MILD_PENALTY_MIN_VOTES),
-                    base_score * RankingConfig.MILD_PENALTY_FACTOR
-                ),
-                else_ = base_score
-            )
-
-            order_by = final_score.desc() if query.sort_order == 'desc' else final_score.asc()
-
-        elif query.sort_method == 'created_time':
-            order_by = Thread.created_at.desc() if query.sort_order == 'desc' else Thread.created_at.asc()
-        elif query.sort_method == 'active_time':
-            order_by = Thread.last_active_at.desc() if query.sort_order == 'desc' else Thread.last_active_at.asc()
-        elif query.sort_method == 'reaction_count':
-            order_by = Thread.reaction_count.desc() if query.sort_order == 'desc' else Thread.reaction_count.asc()
         else:
-            # 默认回退到活跃时间排序
-            order_by = Thread.last_active_at.desc() if query.sort_order == 'desc' else Thread.last_active_at.asc()
+            tag_weight = RankingConfig.DEFAULT_TAG_SCORE
+            total_votes = 0
 
-        statement = statement.order_by(order_by).offset(offset).limit(limit)
-        
-        result = await self.session.execute(statement)
-        return result.unique().all()
+        # --- 2. 计算时间权重 (指数衰减) ---
+        # julianday 计算天数差，更精确
+        time_diff_days = func.julianday('now') - func.julianday(Thread.last_active_at)
+        time_weight = func.exp(-RankingConfig.TIME_DECAY_RATE * time_diff_days)
+
+        # --- 3. 计算反应权重 (对数归一化) ---
+        reaction_weight = func.min(
+            RankingConfig.MAX_REACTION_SCORE,
+            func.log(cast(Thread.reaction_count, Float) + 1) / func.log(RankingConfig.REACTION_LOG_BASE + 1)
+        )
+
+        # --- 4. 计算基础综合分数 ---
+        base_score = (
+            time_weight * RankingConfig.TIME_WEIGHT_FACTOR +
+            tag_weight * RankingConfig.TAG_WEIGHT_FACTOR +
+            reaction_weight * RankingConfig.REACTION_WEIGHT_FACTOR
+        )
+
+        # --- 5. 应用恶评惩罚 ---
+        final_score = case(
+            (
+                (tag_weight < RankingConfig.SEVERE_PENALTY_THRESHOLD) &
+                (total_votes >= RankingConfig.SEVERE_PENALTY_MIN_VOTES),
+                base_score * RankingConfig.SEVERE_PENALTY_FACTOR
+            ),
+            (
+                (tag_weight < RankingConfig.MILD_PENALTY_THRESHOLD) &
+                (total_votes >= RankingConfig.MILD_PENALTY_MIN_VOTES),
+                base_score * RankingConfig.MILD_PENALTY_FACTOR
+            ),
+            else_ = base_score
+        )
+
+        return final_score.desc() if query.sort_order == 'desc' else final_score.asc()
+
+    async def search_threads(self, query: ThreadSearchQuery, offset: int, limit: int) -> Sequence[Thread]:
+        """根据搜索条件搜索帖子并分页"""
+        try:
+            statement = select(Thread).options(selectinload(Thread.tags))
+            statement = self._apply_search_filters(query, statement)
+
+            # 排序
+            if query.sort_method == 'comprehensive':
+                order_by = self._get_comprehensive_order_by(query)
+            elif query.sort_method == 'created_time':
+                order_by = Thread.created_at.desc() if query.sort_order == 'desc' else Thread.created_at.asc()
+            elif query.sort_method == 'active_time':
+                order_by = Thread.last_active_at.desc() if query.sort_order == 'desc' else Thread.last_active_at.asc()
+            elif query.sort_method == 'reaction_count':
+                order_by = Thread.reaction_count.desc() if query.sort_order == 'desc' else Thread.reaction_count.asc()
+            else:
+                # 默认回退到活跃时间排序
+                order_by = Thread.last_active_at.desc() if query.sort_order == 'desc' else Thread.last_active_at.asc()
+
+            statement = statement.order_by(order_by).offset(offset).limit(limit)
+            
+            result = await self.session.execute(statement)
+            return result.scalars().unique().all()
+        except Exception as e:
+            logging.error("Error during search_threads execution", exc_info=True)
+            raise
 
     async def get_user_preferences(self, user_id: int) -> Optional[UserSearchPreferences]:
         """获取用户的搜索偏好设置。"""
@@ -197,4 +207,4 @@ class SearchRepository:
             .distinct()
         )
         result = await self.session.execute(statement)
-        return result.all()
+        return result.scalars().all()

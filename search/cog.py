@@ -6,6 +6,7 @@ import logging
 
 from ranking_config import RankingConfig
 from shared.discord_utils import safe_defer
+from .models.dto.tag import TagDTO
 from .views.author_search_view import NewAuthorTagSelectionView
 from .views.global_search_view import GlobalSearchView
 from sqlalchemy.orm import sessionmaker
@@ -34,15 +35,27 @@ class Search(commands.Cog):
         self.channel_tags_cache = {}  # 缓存频道tags
         self.global_search_view = GlobalSearchView(self)
         self.persistent_channel_search_view = PersistentChannelSearchView(self)
+        self._has_cached_tags = False # 用于确保 on_ready 只执行一次缓存
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """当机器人准备就绪时，执行一次性的缓存任务"""
+        if not self._has_cached_tags:
+            logger.info("机器人已准备就绪，开始缓存频道标签...")
+            await self.cache_channel_tags()
+            self._has_cached_tags = True
+
+    @commands.Cog.listener()
+    async def on_index_updated(self):
+        """监听由 Indexer 发出的索引更新事件。"""
+        logger.info("接收到 'index_updated' 事件，正在刷新搜索模块的标签缓存...")
+        await self.cache_channel_tags()
 
     async def cog_load(self):
         """在Cog加载时注册持久化View"""
         # 注册持久化view，使其在bot重启后仍能响应
         self.bot.add_view(self.global_search_view)
         self.bot.add_view(self.persistent_channel_search_view)
-        
-        # 缓存频道tags
-        await self.cache_channel_tags()
 
     async def cache_channel_tags(self):
         """缓存所有已索引频道的tags"""
@@ -50,8 +63,8 @@ class Search(commands.Cog):
             # 获取已索引的频道ID
             async with self.session_factory() as session:
                 repo = self.tag_system_repo(session)
-                indexed_channel_ids_tuples = await repo.get_indexed_channel_ids()
-                indexed_channel_ids = {row[0] for row in indexed_channel_ids_tuples}
+                indexed_channel_ids_list = await repo.get_indexed_channel_ids()
+                indexed_channel_ids = set(indexed_channel_ids_list)
 
             self.channel_tags_cache = {}
 
@@ -66,17 +79,19 @@ class Search(commands.Cog):
         except Exception as e:
             logger.warning(f"缓存频道tags时出错: {e}", exc_info=True)
 
-    def get_merged_tags(self, channel_ids: list[int]) -> list[tuple[int, str]]:
-        """获取多个频道的合并tags，重名tag会被合并显示"""
+    def get_merged_tags(self, channel_ids: list[int]) -> list[TagDTO]:
+        """
+        获取多个频道的合并tags，重名tag会被合并显示。
+        返回一个 TagDTO 对象列表
+        """
         all_tags_names = set()
         
         for channel_id in channel_ids:
             channel_tags = self.channel_tags_cache.get(channel_id, {})
             all_tags_names.update(channel_tags.keys())
         
-        # 返回合并后的tag列表，使用tag名称作为唯一标识
-        # tag_id设为0，因为我们主要用tag名称进行搜索
-        return [(0, tag_name) for tag_name in sorted(all_tags_names)]
+        # 返回 TagDTO 对象列表，确保后续代码可以安全地访问 .id 和 .name
+        return [TagDTO(id=0, name=tag_name) for tag_name in sorted(all_tags_names)]
 
     # ----- 用户偏好设置 -----
     @app_commands.command(name="每页结果数量", description="设置每页展示的搜索结果数量（3-10）")
@@ -454,8 +469,8 @@ class Search(commands.Cog):
         try:
             async with self.session_factory() as session:
                 repo = self.tag_system_repo(session)
-                indexed_channel_ids_tuples = await repo.get_indexed_channel_ids()
-                indexed_channel_ids = {row[0] for row in indexed_channel_ids_tuples}
+                indexed_channel_ids_list = await repo.get_indexed_channel_ids()
+                indexed_channel_ids = set(indexed_channel_ids_list)
             
             logger.debug(f"从数据库找到 {len(indexed_channel_ids)} 个已索引频道ID: {indexed_channel_ids}")
 
@@ -531,15 +546,7 @@ class Search(commands.Cog):
     async def _build_thread_embed(self, thread: 'ThreadModel', guild: discord.Guild, preview_mode: str = "thumbnail") -> discord.Embed:
         """根据Thread ORM对象构建嵌入消息"""
         
-        # 尝试从缓存或API获取作者信息
-        try:
-            author = self.bot.get_user(thread.author_id) or await self.bot.api_scheduler.submit(
-                coro=self.bot.fetch_user(thread.author_id),
-                priority=1 # 获取用户信息是高优的，因为它直接影响embed的显示
-            )
-            author_display = f"作者 {author.mention}" if author else f"作者 <@{thread.author_id}>"
-        except discord.NotFound:
-            author_display = f"作者 <@{thread.author_id}>"
+        author_display = f"作者 <@{thread.author_id}>"
 
         embed = discord.Embed(
             title=thread.title,
@@ -552,7 +559,7 @@ class Search(commands.Cog):
 
         # 基础统计信息
         basic_stats = (
-            f"发帖日期: **{thread.timestamp.strftime('%Y-%m-%d %H:%M:%S')}**\n"
+            f"发帖日期: **{thread.created_at.strftime('%Y-%m-%d %H:%M:%S')}** | "
             f"最近活跃: **{thread.last_active_at.strftime('%Y-%m-%d %H:%M:%S')}**\n"
             f"最高反应数: **{thread.reaction_count}** | 总回复数: **{thread.reply_count}**\n"
             f"标签: **{', '.join(tag_names) if tag_names else '无'}**"
@@ -565,16 +572,16 @@ class Search(commands.Cog):
         )
         
         # 首楼摘要
-        excerpt = thread.first_message_content or ""
+        excerpt = thread.first_message_excerpt or ""
         excerpt_display = excerpt[:200] + "..." if len(excerpt) > 200 else (excerpt or "无内容")
         embed.add_field(name="首楼摘要", value=excerpt_display, inline=False)
         
         # 根据用户偏好设置预览图显示方式
-        if thread.first_image_url:
+        if thread.thumbnail_url:
             if preview_mode == "image":
-                embed.set_image(url=thread.first_image_url)
+                embed.set_image(url=thread.thumbnail_url)
             else:  # thumbnail
-                embed.set_thumbnail(url=thread.first_image_url)
+                embed.set_thumbnail(url=thread.thumbnail_url)
         
         return embed
             
@@ -593,18 +600,43 @@ class Search(commands.Cog):
         :return: 包含搜索结果信息的字典
         """
         try:
+            logger.debug(f"--- 搜索开始 (Page: {page}) ---")
+            logger.debug(f"初始QO: {search_qo}")
             async with self.session_factory() as session:
                 repo = SearchRepository(session)
                 user_prefs = await repo.get_user_preferences(interaction.user.id)
-                per_page = user_prefs.results_per_page if user_prefs else 5
-                preview_mode = user_prefs.preview_image_mode if user_prefs else "thumbnail"
+                logger.debug(f"用户偏好: {user_prefs}")
+                
+                per_page = 5
+                preview_mode = "thumbnail"
+                if user_prefs:
+                    per_page = user_prefs.results_per_page
+                    preview_mode = user_prefs.preview_image_mode
+                    
+                    # 合并偏好设置到查询对象
+                    # 只有当查询对象中没有相应值时，才使用偏好设置
+                    if search_qo.include_authors is None:
+                        search_qo.include_authors = user_prefs.include_authors
+                    if search_qo.exclude_authors is None:
+                        search_qo.exclude_authors = user_prefs.exclude_authors
+                    if search_qo.after_ts is None:
+                        search_qo.after_ts = user_prefs.after_date
+                    if search_qo.before_ts is None:
+                        search_qo.before_ts = user_prefs.before_date
+                    
+                    # 标签逻辑总是以用户偏好为准，除非视图有特殊覆盖
+                    # 在这个场景下，我们让偏好覆盖默认值
+                    if user_prefs.tag_logic:
+                        search_qo.tag_logic = user_prefs.tag_logic
+                
+                logger.debug(f"合并后QO: {search_qo}")
 
                 # 设置分页
-                search_qo.offset = (page - 1) * per_page
-                search_qo.limit = per_page
+                offset = (page - 1) * per_page
+                limit = per_page
 
                 # 执行搜索
-                threads = await repo.search_threads(search_qo, offset=search_qo.offset, limit=search_qo.limit)
+                threads = await repo.search_threads(search_qo, offset=offset, limit=limit)
                 total_threads = await repo.count_threads(search_qo)
 
             if not threads:
@@ -625,7 +657,7 @@ class Search(commands.Cog):
                 'max_page': (total_threads + per_page - 1) // per_page
             }
         except Exception as e:
-            print(f"搜索时发生错误: {e}")
+            logger.error(f"搜索时发生错误: {e}", exc_info=True)
             return {'has_results': False, 'error': str(e)}
 
 

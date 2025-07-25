@@ -30,7 +30,7 @@ class GlobalSearchView(discord.ui.View):
 
         channels = [self.cog.bot.get_channel(ch_id) for ch_id in indexed_channel_ids if isinstance(self.cog.bot.get_channel(ch_id), discord.ForumChannel)]
         
-        view = ChannelSelectionView(self.cog, interaction, channels)
+        view = ChannelSelectionView(self.cog, interaction, channels, indexed_channel_ids)
         await self.cog.bot.api_scheduler.submit(
             coro=interaction.followup.send("请选择要搜索的频道：", view=view, ephemeral=True),
             priority=1

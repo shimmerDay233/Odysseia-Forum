@@ -33,9 +33,9 @@ class IndexerDashboard(discord.ui.View):
         logging.info(f"[{self.channel.id}] Dashboard.start() called.")
         self.interaction = interaction
         embed = self.create_embed()
-        # build_index 中已经 defer，这里使用 followup
+        # build_index 中已经 defer，这里使用 edit_original_response 更新占位符
         await self.cog.bot.api_scheduler.submit(
-            coro=interaction.followup.send(embed=embed, view=self, ephemeral=True),
+            coro=interaction.edit_original_response(embed=embed, view=self),
             priority=1
         )
         self.cog.bot.loop.create_task(self.cog.run_indexer(self))
@@ -43,11 +43,11 @@ class IndexerDashboard(discord.ui.View):
         logging.info(f"[{self.channel.id}] Dashboard.start() finished, tasks created.")
 
     def get_progress(self):
-        """获取此特定索引作业的进度。"""
+        """获取此特定索引作业的进度"""
         return self.progress
 
     def create_embed(self, progress_stats=None):
-        """创建或更新嵌入消息。"""
+        """创建或更新嵌入消息"""
         progress_stats = progress_stats or self.get_progress()
         
         title = f"正在索引频道: {self.channel.name}"
@@ -91,7 +91,7 @@ class IndexerDashboard(discord.ui.View):
         await self.update_embed() 
 
     async def update_embed(self):
-        """更新嵌入消息。"""
+        """更新嵌入消息"""
         if not self.interaction:
             return
 

@@ -92,7 +92,7 @@ class NewAuthorTagSelectionView(discord.ui.View):
 
         indexed_channel_ids = await self.cog.tag_system_repo.get_indexed_channel_ids()
 
-        qo = ThreadSearchQO(
+        qo = ThreadSearchQuery(
             channel_ids=list(indexed_channel_ids),
             author_ids=[self.author_id],
             include_tag_ids=list(self.include_tags),

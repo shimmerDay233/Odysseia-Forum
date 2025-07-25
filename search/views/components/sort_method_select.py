@@ -32,5 +32,4 @@ class SortMethodSelect(discord.ui.Select):
         self.update_callback = update_callback
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.sort_method = self.values[0]
-        await self.update_callback(interaction)
+        await self.update_callback(interaction, self.values[0])
